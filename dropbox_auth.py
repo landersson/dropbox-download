@@ -13,6 +13,7 @@ Usage:
     Or with just app key (PKCE flow):
     python dropbox_auth.py --app-key YOUR_APP_KEY
 """
+from __future__ import annotations
 
 import argparse
 import json

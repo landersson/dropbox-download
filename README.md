@@ -12,6 +12,9 @@ Download large folders from Dropbox shared links that are too big for the web in
 
 ## Prerequisites
 
+- Python 3.7 or later
+- `dropbox` Python package
+
 ```bash
 # Create and activate a virtual environment
 python3 -m venv ~/.virtualenvs/dropbox

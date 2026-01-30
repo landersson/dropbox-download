@@ -10,6 +10,7 @@ Usage:
     Option 2: Use short-lived access token
         python dropbox_download.py --token TOKEN "https://www.dropbox.com/scl/fo/..."
 """
+from __future__ import annotations
 
 import argparse
 import json
