@@ -194,21 +194,21 @@ def download_folder_recursive(dbx: dropbox.Dropbox, shared_link_url: str,
             skipped_count += sk
 
         elif isinstance(entry, FileMetadata):
-            # Build local path
+            # Build local path - normalize to avoid double slashes
             relative_path = entry_path.lstrip('/')
-            local_path = local_base / relative_path
+            local_path = (local_base / relative_path).resolve()
+
+            # Check if already exists with correct size
+            if local_path.exists() and local_path.stat().st_size == entry.size:
+                skipped_count += 1
+                continue
+
+            size_mb = entry.size / (1024 * 1024)
 
             if dry_run:
-                size_mb = entry.size / (1024 * 1024)
                 print(f"  Would download: {entry_path} ({size_mb:.2f} MB) -> {local_path}")
                 success_count += 1
             else:
-                # Check if already exists
-                if local_path.exists() and local_path.stat().st_size == entry.size:
-                    skipped_count += 1
-                    continue
-
-                size_mb = entry.size / (1024 * 1024)
                 print(f"  Downloading: {entry_path} ({size_mb:.2f} MB)...", end=" ", flush=True)
                 if download_file(dbx, shared_link_url, entry_path, local_path, entry.size):
                     print("OK")
