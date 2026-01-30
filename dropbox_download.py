@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -28,6 +29,95 @@ import requests.exceptions
 MAX_RETRIES = 5
 RETRY_DELAY = 5  # seconds
 CREDENTIALS_FILE = Path.home() / ".dropbox_credentials.json"
+
+
+@dataclass
+class DownloadStats:
+    """Track download progress and calculate speed/ETA."""
+    total_files: int = 0
+    total_bytes: int = 0
+    downloaded_files: int = 0
+    downloaded_bytes: int = 0
+    skipped_files: int = 0
+    skipped_bytes: int = 0
+    failed_files: int = 0
+    start_time: float = field(default_factory=time.time)
+
+    # For rolling average speed calculation
+    recent_downloads: list = field(default_factory=list)  # [(timestamp, bytes), ...]
+
+    def add_download(self, size: int):
+        """Record a completed download."""
+        self.downloaded_files += 1
+        self.downloaded_bytes += size
+        self.recent_downloads.append((time.time(), size))
+        # Keep only last 20 downloads for rolling average
+        if len(self.recent_downloads) > 20:
+            self.recent_downloads.pop(0)
+
+    def add_skip(self, size: int):
+        """Record a skipped file."""
+        self.skipped_files += 1
+        self.skipped_bytes += size
+
+    def add_failure(self):
+        """Record a failed download."""
+        self.failed_files += 1
+
+    def get_speed_mbps(self) -> float:
+        """Calculate current download speed in MB/s using rolling average."""
+        if len(self.recent_downloads) < 2:
+            # Use overall average if not enough recent data
+            elapsed = time.time() - self.start_time
+            if elapsed > 0:
+                return (self.downloaded_bytes / (1024 * 1024)) / elapsed
+            return 0.0
+
+        # Calculate speed from recent downloads
+        first_time = self.recent_downloads[0][0]
+        last_time = self.recent_downloads[-1][0]
+        total_bytes = sum(size for _, size in self.recent_downloads)
+
+        elapsed = last_time - first_time
+        if elapsed > 0:
+            return (total_bytes / (1024 * 1024)) / elapsed
+        return 0.0
+
+    def get_eta_str(self) -> str:
+        """Calculate estimated time remaining."""
+        speed_bps = self.get_speed_mbps() * 1024 * 1024  # Convert to bytes/sec
+        if speed_bps <= 0:
+            return "calculating..."
+
+        remaining_bytes = self.total_bytes - self.downloaded_bytes - self.skipped_bytes
+        if remaining_bytes <= 0:
+            return "done"
+
+        seconds_remaining = remaining_bytes / speed_bps
+
+        if seconds_remaining < 60:
+            return f"{int(seconds_remaining)}s"
+        elif seconds_remaining < 3600:
+            mins = int(seconds_remaining / 60)
+            secs = int(seconds_remaining % 60)
+            return f"{mins}m {secs}s"
+        else:
+            hours = int(seconds_remaining / 3600)
+            mins = int((seconds_remaining % 3600) / 60)
+            return f"{hours}h {mins}m"
+
+    def get_progress_str(self) -> str:
+        """Get a progress string with speed and ETA."""
+        speed = self.get_speed_mbps()
+        eta = self.get_eta_str()
+        pct = 0
+        if self.total_bytes > 0:
+            pct = ((self.downloaded_bytes + self.skipped_bytes) / self.total_bytes) * 100
+
+        downloaded_gb = self.downloaded_bytes / (1024 * 1024 * 1024)
+        total_gb = self.total_bytes / (1024 * 1024 * 1024)
+
+        return f"[{pct:.1f}% | {downloaded_gb:.2f}/{total_gb:.2f} GB | {speed:.2f} MB/s | ETA: {eta}]"
 
 
 def load_credentials() -> dict | None:
@@ -100,6 +190,46 @@ def list_folder_contents(dbx: dropbox.Dropbox, shared_link_url: str, path: str =
     return all_entries
 
 
+def scan_folder_recursive(dbx: dropbox.Dropbox, shared_link_url: str,
+                          remote_path: str, local_base: Path) -> tuple[int, int, int, int]:
+    """Scan folder to count files and bytes (for progress calculation).
+
+    Returns: (total_files, total_bytes, skip_files, skip_bytes)
+    """
+    total_files = 0
+    total_bytes = 0
+    skip_files = 0
+    skip_bytes = 0
+
+    entries = list_folder_contents(dbx, shared_link_url, remote_path)
+
+    for entry in entries:
+        if remote_path:
+            entry_path = f"{remote_path}/{entry.name}"
+        else:
+            entry_path = f"/{entry.name}"
+
+        if isinstance(entry, FolderMetadata):
+            tf, tb, sf, sb = scan_folder_recursive(dbx, shared_link_url, entry_path, local_base)
+            total_files += tf
+            total_bytes += tb
+            skip_files += sf
+            skip_bytes += sb
+
+        elif isinstance(entry, FileMetadata):
+            total_files += 1
+            total_bytes += entry.size
+
+            # Check if already exists
+            relative_path = entry_path.lstrip('/')
+            local_path = (local_base / relative_path).resolve()
+            if local_path.exists() and local_path.stat().st_size == entry.size:
+                skip_files += 1
+                skip_bytes += entry.size
+
+    return total_files, total_bytes, skip_files, skip_bytes
+
+
 def download_file(dbx: dropbox.Dropbox, shared_link_url: str, file_path: str,
                   local_path: Path, expected_size: int) -> bool:
     """Download a single file from the shared folder with retry logic."""
@@ -126,14 +256,25 @@ def download_file(dbx: dropbox.Dropbox, shared_link_url: str, file_path: str,
 
             with open(local_path, 'wb') as f:
                 f.write(response.content)
+                f.flush()
+                os.fsync(f.fileno())
 
-            # Verify size
-            if local_path.stat().st_size == expected_size:
-                return True
-            else:
-                print(f"\n  Size mismatch for {file_path}, retrying...")
+            # Verify size (with retry for slow filesystems)
+            for _ in range(3):
+                try:
+                    if local_path.exists() and local_path.stat().st_size == expected_size:
+                        return True
+                    time.sleep(0.1)
+                except OSError:
+                    time.sleep(0.1)
+
+            # Size mismatch or file missing
+            print(f"\n  Size mismatch or missing file for {file_path}, retrying...")
+            try:
                 local_path.unlink()
-                continue
+            except FileNotFoundError:
+                pass
+            continue
 
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
             if attempt < MAX_RETRIES - 1:
@@ -163,14 +304,9 @@ def download_file(dbx: dropbox.Dropbox, shared_link_url: str, file_path: str,
 
 def download_folder_recursive(dbx: dropbox.Dropbox, shared_link_url: str,
                               remote_path: str, local_base: Path,
-                              dry_run: bool = False) -> tuple[int, int, int]:
-    """Recursively download all files from a folder.
-
-    Returns: (success_count, fail_count, skipped_count)
-    """
-    success_count = 0
-    fail_count = 0
-    skipped_count = 0
+                              stats: DownloadStats,
+                              dry_run: bool = False) -> None:
+    """Recursively download all files from a folder."""
 
     entries = list_folder_contents(dbx, shared_link_url, remote_path)
 
@@ -183,15 +319,13 @@ def download_folder_recursive(dbx: dropbox.Dropbox, shared_link_url: str,
 
         if isinstance(entry, FolderMetadata):
             # Recurse into subfolder
-            s, f, sk = download_folder_recursive(
+            download_folder_recursive(
                 dbx, shared_link_url,
                 entry_path,
                 local_base,
+                stats,
                 dry_run
             )
-            success_count += s
-            fail_count += f
-            skipped_count += sk
 
         elif isinstance(entry, FileMetadata):
             # Build local path - normalize to avoid double slashes
@@ -200,24 +334,23 @@ def download_folder_recursive(dbx: dropbox.Dropbox, shared_link_url: str,
 
             # Check if already exists with correct size
             if local_path.exists() and local_path.stat().st_size == entry.size:
-                skipped_count += 1
+                stats.add_skip(entry.size)
                 continue
 
             size_mb = entry.size / (1024 * 1024)
 
             if dry_run:
                 print(f"  Would download: {entry_path} ({size_mb:.2f} MB) -> {local_path}")
-                success_count += 1
+                stats.downloaded_files += 1
             else:
-                print(f"  Downloading: {entry_path} ({size_mb:.2f} MB)...", end=" ", flush=True)
+                progress = stats.get_progress_str()
+                print(f"  {progress} {entry.name} ({size_mb:.2f} MB)...", end=" ", flush=True)
                 if download_file(dbx, shared_link_url, entry_path, local_path, entry.size):
                     print("OK")
-                    success_count += 1
+                    stats.add_download(entry.size)
                 else:
                     print("FAILED")
-                    fail_count += 1
-
-    return success_count, fail_count, skipped_count
+                    stats.add_failure()
 
 
 def main():
@@ -277,20 +410,53 @@ def main():
     # Set up output directory
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
-
     print(f"Output directory: {output_dir.absolute()}")
-    print(f"\n{'Listing' if args.dry_run else 'Downloading'} files (skipping already downloaded)...")
 
-    # Download files (start with empty path for root of shared folder)
-    success, fail, skipped = download_folder_recursive(
-        dbx, args.url, "", output_dir, args.dry_run
+    # Scan folder first to get totals
+    print("\nScanning folder contents...")
+    total_files, total_bytes, skip_files, skip_bytes = scan_folder_recursive(
+        dbx, args.url, "", output_dir
     )
 
+    total_gb = total_bytes / (1024 * 1024 * 1024)
+    skip_gb = skip_bytes / (1024 * 1024 * 1024)
+    to_download = total_files - skip_files
+    to_download_gb = (total_bytes - skip_bytes) / (1024 * 1024 * 1024)
+
+    print(f"  Total: {total_files} files ({total_gb:.2f} GB)")
+    print(f"  Already downloaded: {skip_files} files ({skip_gb:.2f} GB)")
+    print(f"  To download: {to_download} files ({to_download_gb:.2f} GB)")
+
+    if to_download == 0:
+        print("\nAll files already downloaded!")
+        sys.exit(0)
+
+    # Initialize stats
+    stats = DownloadStats(
+        total_files=total_files,
+        total_bytes=total_bytes,
+        skipped_files=skip_files,
+        skipped_bytes=skip_bytes,
+    )
+
+    print(f"\n{'Listing' if args.dry_run else 'Downloading'} files...")
+
+    # Download files (start with empty path for root of shared folder)
+    download_folder_recursive(dbx, args.url, "", output_dir, stats, args.dry_run)
+
+    # Final summary
+    elapsed = time.time() - stats.start_time
+    elapsed_str = f"{int(elapsed // 3600)}h {int((elapsed % 3600) // 60)}m {int(elapsed % 60)}s"
+    avg_speed = (stats.downloaded_bytes / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+
     print(f"\nComplete:")
-    print(f"  Downloaded: {success} files")
-    print(f"  Skipped (already existed): {skipped} files")
-    if fail > 0:
-        print(f"  Failed: {fail} files")
+    print(f"  Downloaded: {stats.downloaded_files} files ({stats.downloaded_bytes / (1024**3):.2f} GB)")
+    print(f"  Skipped (already existed): {stats.skipped_files} files")
+    print(f"  Time: {elapsed_str}")
+    print(f"  Average speed: {avg_speed:.2f} MB/s")
+
+    if stats.failed_files > 0:
+        print(f"  Failed: {stats.failed_files} files")
         sys.exit(1)
 
 
