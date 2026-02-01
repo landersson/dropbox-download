@@ -32,6 +32,11 @@ RETRY_DELAY = 5  # seconds
 CREDENTIALS_FILE = Path.home() / ".dropbox_credentials.json"
 
 
+class DiskFullError(Exception):
+    """Raised when disk is full and download cannot continue."""
+    pass
+
+
 @dataclass
 class DownloadStats:
     """Track download progress and calculate speed/ETA."""
@@ -291,6 +296,24 @@ def download_file(dbx: dropbox.Dropbox, shared_link_url: str, file_path: str,
             print(f"\n  Auth error: {e}")
             return False
 
+        except OSError as e:
+            # Handle disk full and other OS errors
+            import errno
+            if e.errno == errno.ENOSPC:
+                print(f"\n  ERROR: Disk full! Cannot continue.")
+                raise DiskFullError(str(e)) from e
+            elif e.errno == errno.EIO:
+                print(f"\n  ERROR: I/O error writing file.")
+                raise
+            else:
+                if attempt < MAX_RETRIES - 1:
+                    delay = RETRY_DELAY * (attempt + 1)
+                    print(f"\n  OS error, retrying in {delay}s... ({attempt + 1}/{MAX_RETRIES}): {e}")
+                    time.sleep(delay)
+                else:
+                    print(f"\n  Failed after {MAX_RETRIES} attempts: {e}")
+                    return False
+
         except ApiError as e:
             if attempt < MAX_RETRIES - 1:
                 delay = RETRY_DELAY * (attempt + 1)
@@ -443,14 +466,27 @@ def main():
     print(f"\n{'Listing' if args.dry_run else 'Downloading'} files...")
 
     # Download files (start with empty path for root of shared folder)
-    download_folder_recursive(dbx, args.url, "", output_dir, stats, args.dry_run)
+    fatal_error = None
+    try:
+        download_folder_recursive(dbx, args.url, "", output_dir, stats, args.dry_run)
+    except DiskFullError as e:
+        fatal_error = f"Disk full: {e}"
+    except KeyboardInterrupt:
+        fatal_error = "Interrupted by user"
+    except Exception as e:
+        fatal_error = f"Unexpected error: {e}"
 
-    # Final summary
+    # Final summary (always show, even on error)
     elapsed = time.time() - stats.start_time
     elapsed_str = f"{int(elapsed // 3600)}h {int((elapsed % 3600) // 60)}m {int(elapsed % 60)}s"
     avg_speed = (stats.downloaded_bytes / (1024 * 1024)) / elapsed if elapsed > 0 else 0
 
-    print(f"\nComplete:")
+    if fatal_error:
+        print(f"\n\nDownload stopped: {fatal_error}")
+        print(f"\nProgress before stopping:")
+    else:
+        print(f"\nComplete:")
+
     print(f"  Downloaded: {stats.downloaded_files} files ({stats.downloaded_bytes / (1024**3):.2f} GB)")
     print(f"  Skipped (already existed): {stats.skipped_files} files")
     print(f"  Time: {elapsed_str}")
@@ -458,6 +494,12 @@ def main():
 
     if stats.failed_files > 0:
         print(f"  Failed: {stats.failed_files} files")
+
+    if fatal_error:
+        print(f"\nRun the same command again to resume after freeing disk space.")
+        sys.exit(1)
+
+    if stats.failed_files > 0:
         sys.exit(1)
 
 
