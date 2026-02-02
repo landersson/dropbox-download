@@ -117,13 +117,14 @@ class DownloadStats:
         speed = self.get_speed_mbps()
         eta = self.get_eta_str()
         pct = 0
+        completed_bytes = self.downloaded_bytes + self.skipped_bytes
         if self.total_bytes > 0:
-            pct = ((self.downloaded_bytes + self.skipped_bytes) / self.total_bytes) * 100
+            pct = (completed_bytes / self.total_bytes) * 100
 
-        downloaded_gb = self.downloaded_bytes / (1024 * 1024 * 1024)
+        completed_gb = completed_bytes / (1024 * 1024 * 1024)
         total_gb = self.total_bytes / (1024 * 1024 * 1024)
 
-        return f"[{pct:.1f}% | {downloaded_gb:.2f}/{total_gb:.2f} GB | {speed:.2f} MB/s | ETA: {eta}]"
+        return f"[{pct:.1f}% | {completed_gb:.2f}/{total_gb:.2f} GB | {speed:.2f} MB/s | ETA: {eta}]"
 
 
 def load_credentials() -> dict | None:
@@ -455,12 +456,10 @@ def main():
         print("\nAll files already downloaded!")
         sys.exit(0)
 
-    # Initialize stats
+    # Initialize stats (don't pre-populate skip counts - they'll be counted during download)
     stats = DownloadStats(
         total_files=total_files,
         total_bytes=total_bytes,
-        skipped_files=skip_files,
-        skipped_bytes=skip_bytes,
     )
 
     print(f"\n{'Listing' if args.dry_run else 'Downloading'} files...")
